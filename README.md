@@ -1,6 +1,6 @@
 # Honor MagicBook Pro 16 (2026) on Linux
 
-`xwc_p_fix.sh` is one interactive script. It applies three fixes on the **HONOR MagicBook Pro 16 (2026)**: DMI product `XWC-P`, Goodix touchpad `27C6:0F9A` (ACPI `TOPS0102`).
+`xwc_p_fix.sh` is one interactive script. It applies four fixes on the **HONOR MagicBook Pro 16 (2026)**: DMI product `XWC-P`, Goodix touchpad `27C6:0F9A` (ACPI `TOPS0102`), Egis fingerprint reader `1c7a:05aa`.
 
 Tested on Omarchy (Arch, mkinitcpio, Limine), BIOS 1.10, kernel 7.2.8. GRUB support is included but untested.
 
@@ -11,12 +11,14 @@ Tested on Omarchy (Arch, mkinitcpio, Limine), BIOS 1.10, kernel 7.2.8. GRUB supp
 | 1 | Keyboard | Adds `i8042.dumbkbd=1` to the kernel command line. The `XWC-P` is not in mainline's `atkbd` quirk table. The Caps Lock LED stays off. | after reboot |
 | 2 | Touchpad (SSDT) | The factory `I2C_DEVT` table fails to load (`AE_AML_INTERNAL`), so the touchpad never appears. The script installs phreer's fixed SSDT as `/etc/initcpio/acpi_override/SSDT-I2CDEVC.aml` and enables mkinitcpio's `acpi_override` hook. | after reboot |
 | 3 | Left-edge brightness | Builds the HID-BPF filter `honor-tops0102-edge.bpf.c` and installs it with `udev-hid-bpf`. Sliding up or down on the left edge then changes the screen brightness. | immediately |
+| 4 | Fingerprint reader | The Egis `1c7a:05aa` sensor only stores new prints over Microsoft SDCP, which released libfprint does not have yet. The script builds drphilth's `honor-fmbp-libfprint-sdcp` package (libfprint's SDCP branch, [MR 547](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/547), plus device patches) and installs it next to the stock libfprint. You then enroll with `fprintd-enroll`. | after enrolling |
 
 This repository contains only the script. The script clones its sources at pinned commits and checks each file's SHA-256 before using it:
 
 - SSDT override: [phreer/xwc-p-touchpad-ssdt-fix](https://github.com/phreer/xwc-p-touchpad-ssdt-fix)
 - HID-BPF filter: [umr-xiaomai/Honor-MagicBookPro16-2026-Driver-Linux](https://github.com/umr-xiaomai/Honor-MagicBookPro16-2026-Driver-Linux)
 - HID-BPF headers: [libevdev/udev-hid-bpf](https://gitlab.freedesktop.org/libevdev/udev-hid-bpf)
+- SDCP libfprint package: [drphilth/honor-fmbp-libfprint-sdcp](https://github.com/drphilth/honor-fmbp-libfprint-sdcp). Its PKGBUILD pins the libfprint commit and checks each patch's SHA-256.
 
 ## Requirements
 
@@ -26,6 +28,12 @@ sudo pacman -S --needed git clang libbpf udev-hid-bpf
 
 Fix 3 uses your kernel headers (for example `linux-omarchy-headers`) if they are installed. If not, it uses the `vmlinux.h` that ships with udev-hid-bpf.
 
+Fix 4 builds a package with `makepkg`, as the user who ran `sudo`:
+
+```bash
+sudo pacman -S --needed base-devel meson ninja pkgconf glib2-devel git openssl libgusb
+```
+
 ## Usage
 
 ```bash
@@ -33,8 +41,8 @@ git clone https://github.com/shilai-li/honor-magicbook-pro-16-2026-linux.git
 cd honor-magicbook-pro-16-2026-linux
 
 ./xwc_p_fix.sh --status          # what is applied (no root)
-./xwc_p_fix.sh --dry-run 1 2 3   # show what would change, change nothing (no root)
-sudo ./xwc_p_fix.sh              # interactive menu: 1, 2, 3, or a (all)
+./xwc_p_fix.sh --dry-run 1 2 3 4 # show what would change, change nothing (no root)
+sudo ./xwc_p_fix.sh              # interactive menu: 1, 2, 3, 4, or a (all)
 sudo ./xwc_p_fix.sh 2 3          # apply the chosen fixes (still asks to confirm)
 ```
 
@@ -47,6 +55,22 @@ The script:
 
 Reboot after fix 1 or 2.
 
+### After fix 4: enroll a finger
+
+Run these as your normal user, not root:
+
+```bash
+fprintd-enroll -f right-index-finger "$USER"   # about 15 touches; keep going until "enroll-completed"
+fprintd-verify "$USER"                         # one touch, expect "verify-match"
+omarchy-apply-lock                             # Omarchy only: fingerprint unlock on the lock screen
+```
+
+Each touch prints a result. `enroll-finger-not-centered` and `enroll-remove-and-retry` mean touch again. The sensor waits about 10 seconds per touch, so keep going until you see `enroll-completed`.
+
+Don't use `omarchy setup security fingerprint`. It reinstalls the stock libfprint before enrolling.
+
+**Dual boot with Windows:** disable the fingerprint device in Windows (Device Manager, Biometric devices, Disable device). Windows Hello deletes templates it did not create, so booting Windows with the device enabled wipes the Linux enrollment. Uninstalling the driver is not enough, because Windows reinstalls it.
+
 ## Verify
 
 ```bash
@@ -54,6 +78,8 @@ Reboot after fix 1 or 2.
 grep -o i8042.dumbkbd=1 /proc/cmdline                  # fix 1
 ls /sys/bus/hid/devices/ | grep 27C6:0F9A              # fix 2
 cat /sys/class/backlight/intel_backlight/brightness    # fix 3: slide the left edge, then read again
+ldconfig -p | grep libfprint-2.so.2                    # fix 4: /usr/lib/honor-fmbp/... must be listed first
+fprintd-list "$USER"                                   # fix 4: lists your enrolled fingers
 ```
 
 Run `udev-hid-bpf list-loaded` as root. Without root it prints an empty list even when the filter is loaded.
@@ -72,6 +98,9 @@ sudo limine-update
 sudo udev-hid-bpf remove /sys/bus/hid/devices/0018:27C6:0F9A.*
 sudo rm /etc/udev-hid-bpf/honor-tops0102-edge.bpf.o /etc/udev/rules.d/99-hid-bpf-honor-tops0102-edge.rules
 sudo udevadm control --reload
+
+# fix 4 (fprintd goes back to the stock libfprint, which cannot use this reader)
+sudo pacman -R honor-fmbp-libfprint-sdcp
 ```
 
 ## Not covered
@@ -79,7 +108,8 @@ sudo udevadm control --reload
 - Top-left and top-right corner taps, and knuckle taps.
 - Honor hotkeys through `huawei-wmi` (camera toggle, touchpad lock, performance mode, keyboard backlight).
 - Right-edge volume slide. It goes through the embedded controller, not HID, and is not tested here.
+- Fingerprint at the login screen (display manager). Fix 4 covers fprintd, the lock screen through `omarchy-apply-lock`, and any PAM stack you add `pam_fprintd` to yourself.
 
 ## License
 
-The script is MIT. The sources it downloads keep their own licenses: the SSDT override is MIT (phreer), and the HID-BPF filter and headers are GPL-2.0-only.
+The script is MIT. The sources it downloads keep their own licenses: the SSDT override is MIT (phreer), the HID-BPF filter and headers are GPL-2.0-only, and the libfprint package is LGPL-2.1-or-later.

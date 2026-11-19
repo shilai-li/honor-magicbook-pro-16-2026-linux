@@ -7,18 +7,20 @@
 #   1) keyboard   - kernel parameter i8042.dumbkbd=1 (internal keyboard on the i8042 port)
 #   2) touchpad   - ACPI SSDT override, loaded by the mkinitcpio acpi_override hook
 #   3) brightness - HID-BPF filter: touchpad left-edge slide -> brightness up/down
+#   4) fingerprint - SDCP-capable libfprint for the Egis 1c7a:05aa reader (fprintd)
 #
 # Usage:
 #   sudo ./xwc_p_fix.sh              interactive menu
 #   sudo ./xwc_p_fix.sh 1 3          apply fixes 1 and 3 (asks before changing anything)
 #   ./xwc_p_fix.sh --status          show what is applied (no root needed)
-#   ./xwc_p_fix.sh --dry-run [1 2 3] show what would change, change nothing
+#   ./xwc_p_fix.sh --dry-run [1-4]   show what would change, change nothing
 #   ./xwc_p_fix.sh --help
 #
 # Sources are cloned at pinned commits and checked by SHA-256 before use:
 #   SSDT override  https://github.com/phreer/xwc-p-touchpad-ssdt-fix
 #   HID-BPF filter https://github.com/umr-xiaomai/Honor-MagicBookPro16-2026-Driver-Linux
 #   HID-BPF headers https://gitlab.freedesktop.org/libevdev/udev-hid-bpf
+#   SDCP libfprint https://github.com/drphilth/honor-fmbp-libfprint-sdcp
 set -euo pipefail
 
 # --- pinned upstream sources (repo commit file sha256) ---------------------------
@@ -36,6 +38,12 @@ UHB_REPO="https://gitlab.freedesktop.org/libevdev/udev-hid-bpf.git"
 UHB_COMMIT="bbaad639d4b2efe2a909e8b7c594b91e87704ab8"
 UHB_INC="src/bpf"
 
+# The PKGBUILD pins libfprint's SDCP branch (MR 547) by commit and checks its patches.
+FP_REPO="https://github.com/drphilth/honor-fmbp-libfprint-sdcp.git"
+FP_COMMIT="1b6d446a4053ceda21aecf8ecf7e966593a8ec19"
+FP_PKGBUILD="arch/PKGBUILD"
+FP_PKGBUILD_SHA256="8ba1dce5e816f9d6bd61ffd6c2227b0eed1b2e5da5b7fcca1631617f614765e8"
+
 # --- fix 1: keyboard -------------------------------------------------------------
 KBD_PARAM="i8042.dumbkbd=1"
 
@@ -48,6 +56,11 @@ BPF_NAME="honor-tops0102-edge.bpf.o"
 BPF_DST="/etc/udev-hid-bpf/$BPF_NAME"
 BPF_RULE="/etc/udev/rules.d/99-hid-bpf-honor-tops0102-edge.rules"
 TOUCHPAD_GLOB="/sys/bus/hid/devices/0018:27C6:0F9A.*"
+
+# --- fix 4: fingerprint ----------------------------------------------------------
+FP_PKG="honor-fmbp-libfprint-sdcp"
+FP_LIBDIR="/usr/lib/honor-fmbp"
+FP_USB_ID="1c7a:05aa"
 
 DRY_RUN=0
 NEED_INITRAMFS=0
@@ -162,6 +175,22 @@ ssdt_hook_ok() { grep -Eqs '^[^#]*HOOKS.*acpi_override' /etc/mkinitcpio.conf /et
 
 bpf_installed() { [[ -f "$BPF_DST" && -f "$BPF_RULE" ]]; }
 
+fp_reader_present() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [[ -r "$d/idVendor" && -r "$d/idProduct" ]] || continue
+        [[ "$(cat "$d/idVendor"):$(cat "$d/idProduct")" == "$FP_USB_ID" ]] && return 0
+    done
+    return 1
+}
+fp_pkg_installed() { pacman -Q "$FP_PKG" >/dev/null 2>&1; }
+# The SDCP library must be the first libfprint-2.so.2 the loader finds, or fprintd uses the stock one.
+fp_lib_active() {
+    local first
+    first="$(ldconfig -p 2>/dev/null | awk '$1 == "libfprint-2.so.2" { print $NF; exit }')" || true
+    [[ "$first" == "$FP_LIBDIR/"* ]]
+}
+
 yn() { if "$@" >/dev/null 2>&1; then printf '%syes%s' "$c_grn" "$c_off"; else printf '%sno%s' "$c_red" "$c_off"; fi; }
 
 state_label() {
@@ -169,6 +198,7 @@ state_label() {
         1) kbd_in_config && echo "applied" || echo "not applied" ;;
         2) { ssdt_file_ok && ssdt_hook_ok; } && echo "applied" || echo "not applied" ;;
         3) bpf_installed && echo "applied" || echo "not applied" ;;
+        4) { fp_pkg_installed && fp_lib_active; } && echo "applied" || echo "not applied" ;;
     esac
 }
 
@@ -178,6 +208,8 @@ show_status() {
     printf '  2) touchpad    override file: %s   acpi_override hook: %s   touchpad present: %s\n' \
         "$(yn ssdt_file_ok)" "$(yn ssdt_hook_ok)" "$(yn touchpad_dev)"
     printf '  3) brightness  filter + udev rule installed: %s\n' "$(yn bpf_installed)"
+    printf '  4) fingerprint reader %s present: %s   SDCP package: %s   SDCP library active: %s\n' \
+        "$FP_USB_ID" "$(yn fp_reader_present)" "$(yn fp_pkg_installed)" "$(yn fp_lib_active)"
     if [[ -r /sys/class/backlight/intel_backlight/brightness ]]; then
         info "backlight: $(cat /sys/class/backlight/intel_backlight/brightness)/$(cat /sys/class/backlight/intel_backlight/max_brightness)"
     fi
@@ -317,6 +349,58 @@ apply_brightness() {
     fi
 }
 
+# --- fix 4: fingerprint ----------------------------------------------------------
+
+apply_fingerprint() {
+    say "Fix 4: fingerprint reader ($FP_USB_ID, SDCP libfprint)"
+    fp_reader_present || die "no $FP_USB_ID reader found (lsusb). Some units ship a different sensor; this fix is for the Egis one only."
+    command -v pacman >/dev/null 2>&1 || die "this fix builds an Arch package; pacman not found"
+
+    if fp_pkg_installed && fp_lib_active; then
+        info "$FP_PKG already installed and active"
+        return 0
+    fi
+
+    # makepkg refuses to run as root, so build as the user who called sudo.
+    local builder="${SUDO_USER:-}"
+    [[ -n "$builder" && "$builder" != root ]] || die "run this fix with sudo from your normal user (makepkg cannot build as root)"
+
+    local missing=() p
+    for p in base-devel meson ninja pkgconf glib2-devel git openssl libgusb; do
+        pacman -Q "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+    (( ${#missing[@]} == 0 )) || die "missing build packages: sudo pacman -S --needed ${missing[*]}"
+
+    fetch fingerprint "$FP_REPO" "$FP_COMMIT"
+    verify "$TMPDIR_BUILD/fingerprint/$FP_PKGBUILD" "$FP_PKGBUILD_SHA256"
+
+    # fprintd plus the stock libfprint; the SDCP package goes next to it and takes precedence.
+    run pacman -S --needed --noconfirm fprintd
+
+    local pkgdir="$TMPDIR_BUILD/fingerprint/arch" pkgfile
+    run chown -R "$builder:" "$TMPDIR_BUILD/fingerprint"
+    chmod 0755 "$TMPDIR_BUILD"
+    if (( DRY_RUN )); then
+        run sudo -u "$builder" makepkg -f --noconfirm
+        run pacman -U --noconfirm "$pkgdir/$FP_PKG-<version>-x86_64.pkg.tar.zst"
+        return 0
+    fi
+    info "build $FP_PKG (makepkg checks the patch checksums; takes a few minutes)"
+    (cd "$pkgdir" && sudo -u "$builder" makepkg -f --noconfirm >"$TMPDIR_BUILD/makepkg.log" 2>&1) \
+        || { tail -n 30 "$TMPDIR_BUILD/makepkg.log" >&2; die "makepkg failed"; }
+    pkgfile="$(find "$pkgdir" -maxdepth 1 -name "$FP_PKG-[0-9]*-x86_64.pkg.tar.zst" ! -name '*-debug-*' | head -1)"
+    [[ -n "$pkgfile" ]] || die "built package not found in $pkgdir"
+    run pacman -U --noconfirm "$pkgfile"
+    run systemctl restart fprintd
+
+    fp_lib_active || die "$FP_LIBDIR is not the first libfprint-2.so.2 in 'ldconfig -p'; fprintd would use the stock library"
+    info "SDCP library active. Next steps (as your user, not root):"
+    info "  fprintd-enroll -f right-index-finger $builder   # about 15 touches, keep going until enroll-completed"
+    info "  fprintd-verify $builder"
+    command -v omarchy-apply-lock >/dev/null 2>&1 && info "  omarchy-apply-lock                                 # Omarchy lock-screen fingerprint unlock"
+    warn "Dual boot: disable the fingerprint device in Windows Device Manager, or booting Windows wipes the Linux enrollment."
+}
+
 # --- regenerate boot files -------------------------------------------------------
 
 finish() {
@@ -347,7 +431,7 @@ main() {
             -h|--help)  usage; exit 0 ;;
             --status)   status_only=1 ;;
             --dry-run)  DRY_RUN=1 ;;
-            1|2|3)      sel+=("$arg") ;;
+            1|2|3|4)    sel+=("$arg") ;;
             *)          die "unknown argument: $arg (see --help)" ;;
         esac
     done
@@ -369,22 +453,23 @@ main() {
         echo "  1) Keyboard               ($(state_label 1))"
         echo "  2) Touchpad SSDT override ($(state_label 2))"
         echo "  3) Left-edge brightness   ($(state_label 3))"
+        echo "  4) Fingerprint reader     ($(state_label 4))"
         echo "  a) all     q) quit"
         local reply
         read -r -p "Choice (for example: 1 3): " reply || exit 1
         case "$reply" in
             q|Q|"") echo "Nothing changed."; exit 0 ;;
-            a|A)    sel=(1 2 3) ;;
+            a|A)    sel=(1 2 3 4) ;;
             *)      read -r -a sel <<<"${reply//,/ }" ;;
         esac
     fi
 
     local s ordered=()
-    for s in 1 2 3; do
+    for s in 1 2 3 4; do
         [[ " ${sel[*]} " == *" $s "* ]] && ordered+=("$s")
     done
     for s in "${sel[@]}"; do
-        [[ "$s" == [123] ]] || die "invalid choice: $s"
+        [[ "$s" == [1234] ]] || die "invalid choice: $s"
     done
     (( ${#ordered[@]} )) || { echo "Nothing selected."; exit 0; }
 
@@ -398,6 +483,7 @@ main() {
             1) apply_keyboard ;;
             2) apply_ssdt ;;
             3) apply_brightness ;;
+            4) apply_fingerprint ;;
         esac
     done
     finish
